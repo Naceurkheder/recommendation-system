@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.env
+
+# C/C++
+*.o
+*.so
+*.out
+*.exe
+
+# Docker
+*.log
+data/
+
+# Vagrant
+.vagrant/
+*.box
+
+# IDE
+.vscode/
+.idea/
+
+# Secrets (NEVER COMMIT THESE)
+*.pem
+*.key
+credentials.json
