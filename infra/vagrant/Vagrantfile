@@ -1,0 +1,28 @@
+Vagrant.configure("2") do |config|
+  config.vm.box = "ubuntu/focal64"
+  
+  # Network Configuration - Using existing vboxnet0 (192.168.56.x)
+  config.vm.network "private_network", ip: "192.168.56.10", name: "vboxnet0"
+  
+  # Port Forwarding for services
+  config.vm.network "forwarded_port", guest: 8000, host: 8000 # API
+  config.vm.network "forwarded_port", guest: 5432, host: 5432 # PostgreSQL
+  config.vm.network "forwarded_port", guest: 6379, host: 6379 # Redis
+
+  # Resource Allocation (Optimized for 16GB Host)
+  config.vm.provider "virtualbox" do |vb|
+    vb.memory = "4096"
+    vb.cpus = 4
+    vb.name = "recsys-vm"
+  end
+
+  # Synced Folder
+  config.vm.synced_folder "../..", "/vagrant", type: "virtualbox", SharedFoldersEnableSymlinksCreate: false
+
+  # Bootstrap Script
+  config.vm.provision "shell", inline: <<-SHELL
+    apt-get update
+    apt-get install -y docker.io docker-compose git gcc libomp-dev python3-pip postgresql-client
+    usermod -aG docker vagrant
+  SHELL
+end
