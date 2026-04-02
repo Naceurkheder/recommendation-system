@@ -1,25 +1,30 @@
 Vagrant.configure("2") do |config|
   config.vm.box = "ubuntu/focal64"
-  
-  # Network Configuration - Using existing vboxnet0 (192.168.56.x)
-  config.vm.network "private_network", ip: "192.168.56.10", name: "vboxnet0"
-  
-  # Port Forwarding for services
-  config.vm.network "forwarded_port", guest: 8000, host: 8000 # API
-  config.vm.network "forwarded_port", guest: 5432, host: 5432 # PostgreSQL
-  config.vm.network "forwarded_port", guest: 6379, host: 6379 # Redis
+  config.vm.boot_timeout = 600
+  config.ssh.insert_key = false
 
-  # Resource Allocation (Optimized for 16GB Host)
+  # 🔹 Host-only network ONLY — no NAT adapter
+  config.vm.network "private_network", ip: "192.168.56.10", name: "vboxnet0"
+
+  # 🔹 Port forwarding still works via host-only IP
+  config.vm.network "forwarded_port", guest: 8000, host: 8000, host_ip: "192.168.56.1"
+  config.vm.network "forwarded_port", guest: 5432, host: 5432, host_ip: "192.168.56.1"
+  config.vm.network "forwarded_port", guest: 6379, host: 6379, host_ip: "192.168.56.1"
+
   config.vm.provider "virtualbox" do |vb|
     vb.memory = "4096"
     vb.cpus = 4
     vb.name = "recsys-vm"
+    
+    # ✅ Graphics fixes to avoid GUI freeze
+    vb.customize ["modifyvm", :id, "--graphicscontroller", "vmsvga"]
+    vb.customize ["modifyvm", :id, "--vram", "128"]
+    vb.customize ["modifyvm", :id, "--accelerate3d", "off"]
+    vb.customize ["modifyvm", :id, "--natdnshostresolver1", "off"]  # avoids DNS hang on boot
   end
 
-  # Synced Folder
-  config.vm.synced_folder "../..", "/vagrant", type: "virtualbox", SharedFoldersEnableSymlinksCreate: false
+  config.vm.synced_folder "../..", "/vagrant", type: "virtualbox"
 
-  # Bootstrap Script
   config.vm.provision "shell", inline: <<-SHELL
     apt-get update
     apt-get install -y docker.io docker-compose git gcc libomp-dev python3-pip postgresql-client
