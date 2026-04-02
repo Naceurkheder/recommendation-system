@@ -1,6 +1,7 @@
 services:
   db:
     image: postgres:14-alpine
+    restart: always
     environment:
       POSTGRES_USER: recsys_admin
       POSTGRES_PASSWORD: secure_password
@@ -16,7 +17,8 @@ services:
       retries: 5
 
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine  
+    restart: always
     ports:
       - "6379:6379"
     command: redis-server --appendonly yes
@@ -25,6 +27,7 @@ services:
     build:
       context: ../../src/vm-services/api
       dockerfile: ../../../infra/docker/api/Dockerfile
+    restart: always
     ports:
       - "8000:8000"
     depends_on:
