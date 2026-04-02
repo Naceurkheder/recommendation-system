@@ -1,0 +1,37 @@
+services:
+  db:
+    image: postgres:14-alpine
+    environment:
+      POSTGRES_USER: recsys_admin
+      POSTGRES_PASSWORD: secure_password
+      POSTGRES_DB: recsys_db
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U recsys_admin"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+
+  api:
+    build:
+      context: ../../src/vm-services/api
+      dockerfile: ../../../infra/docker/api/Dockerfile
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+      - redis
+    volumes:
+      - ../../src/vm-services/api:/app
+
+volumes:
+  pgdata:
