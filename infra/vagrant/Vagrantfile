@@ -6,7 +6,7 @@ Vagrant.configure("2") do |config|
   # 🔹 Host-only network ONLY — no NAT adapter
   config.vm.network "private_network", ip: "192.168.56.10", name: "vboxnet0"
 
-  # 🔹 Port forwarding still works via host-only IP
+  # 🔹 Port forwarding via host-only IP
   config.vm.network "forwarded_port", guest: 8000, host: 8000, host_ip: "192.168.56.1"
   config.vm.network "forwarded_port", guest: 5432, host: 5432, host_ip: "192.168.56.1"
   config.vm.network "forwarded_port", guest: 6379, host: 6379, host_ip: "192.168.56.1"
@@ -20,14 +20,48 @@ Vagrant.configure("2") do |config|
     vb.customize ["modifyvm", :id, "--graphicscontroller", "vmsvga"]
     vb.customize ["modifyvm", :id, "--vram", "128"]
     vb.customize ["modifyvm", :id, "--accelerate3d", "off"]
-    vb.customize ["modifyvm", :id, "--natdnshostresolver1", "off"]  # avoids DNS hang on boot
+    vb.customize ["modifyvm", :id, "--natdnshostresolver1", "off"]
   end
 
   config.vm.synced_folder "../..", "/vagrant", type: "virtualbox"
 
   config.vm.provision "shell", inline: <<-SHELL
+    # Update system
     apt-get update
-    apt-get install -y docker.io docker-compose git gcc libomp-dev python3-pip postgresql-client
+    apt-get install -y \
+      docker.io docker-compose \
+      build-essential gcc g++ gdb \
+      libomp-dev libpq-dev uuid-dev \
+      git curl wget \
+      python3-pip python3-dev \
+      openmpi-bin libopenmpi-dev \
+      pkg-config
+    
+    # Add vagrant user to docker group
     usermod -aG docker vagrant
+    
+    # Start Docker
+    systemctl enable docker
+    systemctl start docker
+    
+    # Create data directory if needed
+    mkdir -p /vagrant/src/host-cuda/openmp/data
+    
+    echo "✓ VM provisioning complete!"
+    echo ""
+    echo "Recommendation Engine Development VM Ready"
+    echo "=========================================="
+    echo ""
+    echo "SSH into VM:"
+    echo "  vagrant ssh"
+    echo ""
+    echo "Build C implementation:"
+    echo "  cd /vagrant/src/host-cuda/openmp/src && make all"
+    echo ""
+    echo "Start services:"
+    echo "  cd /vagrant && docker-compose -f infra/docker/docker-compose.yml up -d"
+    echo ""
+    echo "API available at: http://192.168.56.10:8000"
+    echo ""
   SHELL
 end

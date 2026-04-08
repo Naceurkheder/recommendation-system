@@ -1,0 +1,44 @@
+# Compiled object files
+*.o
+*.obj
+*.out
+*.exe
+
+# Executables
+rec-engine
+similarity
+
+# Build directories
+build/
+bin/
+dist/
+
+# IDE/Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Dependency files
+*.a
+*.so
+*.dylib
+
+# CSV data files (if large)
+*.csv
+data/
+
+# Temporary files
+*.tmp
+*.bak
+*.log
+
+# OpenMP/CUDA specific
+*.ptx
+*.cubin
