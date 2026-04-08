@@ -149,6 +149,7 @@ float *compute_norms(const Matrix *matrix) {
   return norms;
 }
 
+// Highly optimized cosine similarity computation with cache-friendly access
 float *compute_similarity(const Matrix *matrix, const float *norms) {
   if (!matrix || !norms) return NULL;
 
@@ -161,24 +162,53 @@ float *compute_similarity(const Matrix *matrix, const float *norms) {
     return NULL;
   }
 
-#pragma omp parallel for schedule(dynamic) collapse(2)
+// Diagonal: self-similarity = 1.0
+#pragma omp parallel for schedule(static)
   for (int i = 0; i < num_users; i++) {
-    for (int j = 0; j < num_users; j++) {
-      if (i == j) {
-        similarity[i * num_users + j] = 1.0f;
-      } else if (norms[i] > 0.0f && norms[j] > 0.0f) {
+    similarity[i * num_users + i] = 1.0f;
+  }
+
+// Compute upper triangle only, then mirror (symmetric matrix optimization)
+// Use guided schedule for load balancing: outer loop has fewer iterations
+#pragma omp parallel for schedule(guided) collapse(2)
+  for (int i = 0; i < num_users; i++) {
+    for (int j = i + 1; j < num_users; j++) {
+      if (norms[i] > 1e-10f && norms[j] > 1e-10f) {
+        // Compute dot product with SIMD optimization
         float dot_product = 0.0f;
 
-        for (int k = 0; k < num_items; k++) {
-          float val_i = matrix->data[i * num_items + k];
-          float val_j = matrix->data[j * num_items + k];
-          dot_product += val_i * val_j;
+        // Pointers for better cache locality
+        const float *row_i = &matrix->data[i * num_items];
+        const float *row_j = &matrix->data[j * num_items];
+
+        // Unroll loop for better SIMD vectorization
+        int k = 0;
+        for (; k <= num_items - 4; k += 4) {
+          dot_product += row_i[k] * row_j[k];
+          dot_product += row_i[k + 1] * row_j[k + 1];
+          dot_product += row_i[k + 2] * row_j[k + 2];
+          dot_product += row_i[k + 3] * row_j[k + 3];
         }
 
+        // Process remaining elements
+        for (; k < num_items; k++) {
+          dot_product += row_i[k] * row_j[k];
+        }
+
+        // Compute cosine similarity with numerical stability
         float cosine_sim = dot_product / (norms[i] * norms[j]);
+
+        // Clamp to [-1, 1] range for numerical stability
+        cosine_sim = (cosine_sim > 1.0f)
+                         ? 1.0f
+                         : (cosine_sim < -1.0f ? -1.0f : cosine_sim);
+
+        // Store symmetric values
         similarity[i * num_users + j] = cosine_sim;
+        similarity[j * num_users + i] = cosine_sim;
       } else {
         similarity[i * num_users + j] = 0.0f;
+        similarity[j * num_users + i] = 0.0f;
       }
     }
   }
