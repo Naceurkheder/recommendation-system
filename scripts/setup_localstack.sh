@@ -304,16 +304,6 @@ if [ -z "$EXISTING_SF" ] || [ "$EXISTING_SF" = "None" ]; then
       "Type": "Parallel",
       "Branches": [
         {
-          "StartAt": "UploadMatrix",
-          "States": {
-            "UploadMatrix": {
-              "Type": "Task",
-              "Resource": "arn:aws:lambda:us-east-1:000000000000:function:cache-warmer",
-              "End": true
-            }
-          }
-        },
-        {
           "StartAt": "WarmCache",
           "States": {
             "WarmCache": {
