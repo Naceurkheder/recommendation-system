@@ -1,7 +1,8 @@
 """
 Session-scoped fixtures for integration tests.
-Inserts the fixed-UUID products and users used by TestInteractions so the
-foreign-key constraints on the interactions table are satisfied.
+Inserts the fixed-UUID products used by TestInteractions so the foreign-key
+constraint on the interactions table is satisfied. Users (user_id 1-100) are
+created by seed_data.py which run_all.sh always executes before pytest.
 """
 
 import os
@@ -24,22 +25,14 @@ _TEST_PRODUCTS = [
     ("550e8400-e29b-41d4-a716-446655440012", "Test Product E", "test"),
 ]
 
-# user_id values used in tests; seed_data.py creates users 1-100 so these
-# will exist after seeding, but we ensure them here for a clean DB too.
-_TEST_USERS = [
-    ("Test User 1", "testuser1_fixture@example.com"),
-    ("Test User 2", "testuser2_fixture@example.com"),
-    ("Test User 3", "testuser3_fixture@example.com"),
-    ("Test User 4", "testuser4_fixture@example.com"),
-]
-
 
 @pytest.fixture(scope="session", autouse=True)
 def seed_test_fixtures() -> None:
     """
-    Ensure test products (known UUIDs) and at least 4 users exist in the DB.
-    Idempotent — uses ON CONFLICT DO NOTHING so repeated runs are safe.
-    Skips if the database is unreachable (tests will fail on their own terms).
+    Ensure the five test products with known UUIDs exist in the products table.
+    Uses ON CONFLICT DO NOTHING so the fixture is safe to run repeatedly.
+    Skips gracefully if the database is unreachable (tests will fail on their
+    own terms rather than erroring at fixture setup).
     """
     try:
         conn = psycopg2.connect(DB_URL)
@@ -50,18 +43,6 @@ def seed_test_fixtures() -> None:
     try:
         with conn:
             with conn.cursor() as cur:
-                # Users (GENERATED ALWAYS AS IDENTITY — insert without specifying user_id)
-                for name, email in _TEST_USERS:
-                    cur.execute(
-                        """
-                        INSERT INTO users (name, email)
-                        VALUES (%s, %s)
-                        ON CONFLICT (email) DO NOTHING
-                        """,
-                        (name, email),
-                    )
-
-                # Products with fixed UUIDs
                 psycopg2.extras.execute_batch(
                     cur,
                     """
