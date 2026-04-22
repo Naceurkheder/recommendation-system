@@ -24,13 +24,16 @@ DATABASE_URL = os.getenv(
 INTERACTION_TYPES = ["view", "like", "purchase"]
 WEIGHTS = [0.5, 0.3, 0.2]  # view is most common
 
-NUM_USERS    = 20
-NUM_PRODUCTS = 15
-NUM_INTERACTIONS = 80
+NUM_USERS        = 100
+NUM_PRODUCTS     = 500
+NUM_INTERACTIONS = 10000
 
 SEED_USERS: List[Tuple[str, str]] = [
     (f"User {i}", f"user{i}@example.com") for i in range(1, NUM_USERS + 1)
 ]
+
+CATEGORIES = ["electronics", "books", "clothing", "food", "sports",
+               "home", "toys", "beauty", "automotive", "garden"]
 
 
 def tables_empty(cur) -> bool:
@@ -56,9 +59,8 @@ def seed(conn) -> None:
 
         # Products
         product_ids = []
-        categories = ["electronics", "books", "clothing", "food", "sports"]
         for i in range(NUM_PRODUCTS):
-            cat = categories[i % len(categories)]
+            cat = CATEGORIES[i % len(CATEGORIES)]
             cur.execute(
                 "INSERT INTO products (name, category, metadata) VALUES (%s, %s, %s) RETURNING product_id",
                 (f"Product {i+1}", cat, psycopg2.extras.Json({"index": i})),
