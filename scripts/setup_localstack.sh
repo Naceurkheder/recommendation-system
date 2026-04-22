@@ -78,10 +78,20 @@ DLQ_ARN="arn:aws:sqs:${AWS_REGION}:${ACCOUNT_ID}:compute-jobs-dlq.fifo"
 
 echo "==> SQS: compute-jobs.fifo"
 if ! $AWSCLI sqs get-queue-url --queue-name compute-jobs.fifo 2>/dev/null; then
-    REDRIVE="{\"deadLetterTargetArn\":\"${DLQ_ARN}\",\"maxReceiveCount\":\"3\"}"
     $AWSCLI sqs create-queue \
         --queue-name compute-jobs.fifo \
-        --attributes "FifoQueue=true,ContentBasedDeduplication=true,RedrivePolicy=${REDRIVE}" >/dev/null
+        --attributes FifoQueue=true,ContentBasedDeduplication=true >/dev/null
+    # RedrivePolicy is JSON-in-JSON; set via temp file to avoid shorthand parser issues
+    QUEUE_URL=$($AWSCLI sqs get-queue-url --queue-name compute-jobs.fifo --query QueueUrl --output text)
+    python3 -c "
+import json
+redrive = json.dumps({'deadLetterTargetArn': '${DLQ_ARN}', 'maxReceiveCount': '3'})
+print(json.dumps({'RedrivePolicy': redrive}))
+" > /tmp/sqs_attrs.json
+    $AWSCLI sqs set-queue-attributes \
+        --queue-url "$QUEUE_URL" \
+        --attributes file:///tmp/sqs_attrs.json >/dev/null
+    rm -f /tmp/sqs_attrs.json
     echo "    Created queue with redrive policy"
 else
     echo "    Queue already exists"
@@ -370,12 +380,7 @@ deploy_lambda() {
             --handler "$handler" \
             --role "$LAMBDA_ROLE_ARN" \
             --zip-file "fileb://$zip_file" \
-            --environment "Variables={
-                AWS_ENDPOINT_URL=${LOCALSTACK_URL},
-                AWS_DEFAULT_REGION=${AWS_REGION},
-                AWS_ACCESS_KEY_ID=test,
-                AWS_SECRET_ACCESS_KEY=test
-            }" \
+            --environment "Variables={AWS_ENDPOINT_URL=${LOCALSTACK_URL},AWS_DEFAULT_REGION=${AWS_REGION},AWS_ACCESS_KEY_ID=test,AWS_SECRET_ACCESS_KEY=test}" \
             --timeout 60 \
             --memory-size 256 >/dev/null
         echo "    Deployed: $name"
