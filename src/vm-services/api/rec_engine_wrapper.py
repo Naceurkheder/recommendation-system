@@ -1,215 +1,222 @@
 """
-Recommendation Engine Python Wrapper
-Uses ctypes to interface with the optimized C implementation
+Python wrapper for librec_engine.so (compiled from MPI C sources).
+
+Actual exported symbols used:
+  Matrix  *load_matrix(const char *filename)
+  void     free_matrix(Matrix *matrix)
+  UserRec *get_similar_users(float *sim_matrix, int user_id, int k, int num_users)
+  ItemRec *get_item_recommendations(float *sim, float *ratings, int user_id,
+                                     int k, int num_users, int num_items, int num_neighbors)
+
+Cosine similarity is computed in numpy from the loaded rating matrix.
 """
 
 import ctypes
 import os
-import sys
-from pathlib import Path
 from typing import List, Optional, Tuple
 
+import numpy as np
+
+
+# ── ctypes struct mirrors ──────────────────────────────────────────────────────
+
+class _Matrix(ctypes.Structure):
+    _fields_ = [
+        ("data", ctypes.POINTER(ctypes.c_float)),
+        ("rows", ctypes.c_int),
+        ("cols", ctypes.c_int),
+    ]
+
+
+class _UserRec(ctypes.Structure):
+    _fields_ = [
+        ("user_id",          ctypes.c_int),
+        ("similarity_score", ctypes.c_float),
+    ]
+
+
+class _ItemRec(ctypes.Structure):
+    _fields_ = [
+        ("item_id",          ctypes.c_int),
+        ("predicted_rating", ctypes.c_float),
+    ]
+
+
+# ── Wrapper ───────────────────────────────────────────────────────────────────
 
 class RecEngineWrapper:
-    """High-level Python interface to the C recommendation engine"""
+    """High-level Python interface to the C recommendation engine."""
 
-    def __init__(self, library_path: Optional[str] = None):
-        """
-        Initialize the recommendation engine wrapper
-        
-        Args:
-            library_path: Path to compiled C library (.so file).
-                         If None, searches in common locations.
-        """
+    def __init__(self, library_path: Optional[str] = None) -> None:
         if library_path is None:
-            library_path = self._find_library()
-        
+            library_path = "/usr/local/lib/librec_engine.so"
+
         if not library_path or not os.path.exists(library_path):
             raise RuntimeError(
                 f"Cannot find recommendation engine library at {library_path}\n"
-                f"Please build the C code first using: cd src/host-cuda/openmp/src && make openmp"
+                f"Build with: cd src/host-cuda/mpi/src && make librec_engine.so"
             )
-        
-        try:
-            self.lib = ctypes.CDLL(library_path)
-        except OSError as e:
-            raise RuntimeError(f"Failed to load library {library_path}: {e}")
-        
-        # Define function signatures
+
+        self._lib = ctypes.CDLL(library_path)
+        self._libc = ctypes.CDLL("libc.so.6")
         self._setup_functions()
-        self._initialized = False
-    
-    def _find_library(self) -> Optional[str]:
-        """Search for the compiled recommendation engine library"""
-        # Search in common build locations
-        search_paths = [
-            "./lib/librec_engine.so",
-            "../lib/librec_engine.so",
-            "../../lib/librec_engine.so",
-            "./src/host-cuda/openmp/src/bin/similarity_openmp",
+
+        self._initialized: bool = False
+        self._num_users: int = 0
+        self._num_items: int = 0
+        # Stored as contiguous float32 numpy arrays to avoid repeated copies
+        self._sim_flat: Optional[np.ndarray] = None     # (num_users * num_users,)
+        self._rating_flat: Optional[np.ndarray] = None  # (num_users * num_items,)
+        self._sim_matrix: Optional[np.ndarray] = None   # (num_users, num_users) view
+
+    def _setup_functions(self) -> None:
+        lib = self._lib
+
+        lib.load_matrix.argtypes = [ctypes.c_char_p]
+        lib.load_matrix.restype = ctypes.POINTER(_Matrix)
+
+        lib.free_matrix.argtypes = [ctypes.POINTER(_Matrix)]
+        lib.free_matrix.restype = None
+
+        lib.get_similar_users.argtypes = [
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
         ]
-        
-        for path in search_paths:
-            if os.path.exists(path):
-                return os.path.abspath(path)
-        
-        return None
-    
-    def _setup_functions(self):
-        """Setup C function signatures"""
-        # rec_engine_init
-        self.lib.rec_engine_init.argtypes = [ctypes.c_char_p]
-        self.lib.rec_engine_init.restype = ctypes.c_int
-        
-        # rec_engine_get_similar_users
-        self.lib.rec_engine_get_similar_users.argtypes = [
-            ctypes.c_int, ctypes.c_int
+        lib.get_similar_users.restype = ctypes.POINTER(_UserRec)
+
+        lib.get_item_recommendations.argtypes = [
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
         ]
-        self.lib.rec_engine_get_similar_users.restype = ctypes.POINTER(ctypes.c_int)
-        
-        # rec_engine_get_item_recommendations
-        self.lib.rec_engine_get_item_recommendations.argtypes = [
-            ctypes.c_int, ctypes.c_int, ctypes.c_int
-        ]
-        self.lib.rec_engine_get_item_recommendations.restype = ctypes.POINTER(ctypes.c_int)
-        
-        # rec_engine_get_similarity
-        self.lib.rec_engine_get_similarity.argtypes = [ctypes.c_int, ctypes.c_int]
-        self.lib.rec_engine_get_similarity.restype = ctypes.c_float
-        
-        # rec_engine_get_dimensions
-        self.lib.rec_engine_get_dimensions.argtypes = [
-            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)
-        ]
-        self.lib.rec_engine_get_dimensions.restype = None
-        
-        # rec_engine_cleanup
-        self.lib.rec_engine_cleanup.argtypes = []
-        self.lib.rec_engine_cleanup.restype = None
-        
-        # rec_engine_free_array
-        self.lib.rec_engine_free_array.argtypes = [ctypes.POINTER(ctypes.c_int)]
-        self.lib.rec_engine_free_array.restype = None
-        
-        # rec_engine_print_status
-        self.lib.rec_engine_print_status.argtypes = []
-        self.lib.rec_engine_print_status.restype = None
-    
+        lib.get_item_recommendations.restype = ctypes.POINTER(_ItemRec)
+
+        self._libc.free.argtypes = [ctypes.c_void_p]
+        self._libc.free.restype = None
+
     def init(self, csv_path: str) -> bool:
-        """
-        Initialize the recommendation engine with data
-        
-        Args:
-            csv_path: Path to CSV file with columns: user_id, product_id, rating
-            
-        Returns:
-            True on success, False on failure
-        """
         if not os.path.exists(csv_path):
             raise FileNotFoundError(f"CSV file not found: {csv_path}")
-        
-        result = self.lib.rec_engine_init(csv_path.encode('utf-8'))
-        self._initialized = result == 1
-        return self._initialized
-    
+
+        matrix_ptr = self._lib.load_matrix(csv_path.encode())
+        if not matrix_ptr:
+            return False
+
+        matrix = matrix_ptr.contents
+        num_users: int = matrix.rows
+        num_items: int = matrix.cols
+        n_elems = num_users * num_items
+
+        # Copy rating data out of C-owned memory before freeing
+        rating_np = np.ctypeslib.as_array(matrix.data, shape=(n_elems,)).copy().astype(np.float32)
+        rating_matrix = rating_np.reshape(num_users, num_items)
+
+        # Cosine similarity in numpy
+        norms = np.linalg.norm(rating_matrix, axis=1, keepdims=True)
+        norms[norms == 0.0] = 1.0
+        normalized = rating_matrix / norms
+        sim_matrix: np.ndarray = (normalized @ normalized.T).astype(np.float32)
+
+        self._lib.free_matrix(matrix_ptr)
+
+        # Keep contiguous flat copies so C pointers stay valid during calls
+        self._sim_flat = np.ascontiguousarray(sim_matrix.flatten(), dtype=np.float32)
+        self._rating_flat = np.ascontiguousarray(rating_np, dtype=np.float32)
+        self._sim_matrix = sim_matrix
+        self._num_users = num_users
+        self._num_items = num_items
+        self._initialized = True
+        return True
+
     def get_similar_users(self, user_id: int, k: int = 10) -> List[int]:
-        """
-        Get k most similar users
-        
-        Args:
-            user_id: Target user ID
-            k: Number of similar users to return
-            
-        Returns:
-            List of user IDs sorted by similarity
-        """
         if not self._initialized:
             raise RuntimeError("Engine not initialized. Call init() first.")
-        
-        c_array = self.lib.rec_engine_get_similar_users(user_id, k)
-        if not c_array:
+
+        actual_k = min(k, self._num_users - 1)
+        sim_ptr = self._sim_flat.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+
+        recs_ptr = self._lib.get_similar_users(sim_ptr, user_id, actual_k, self._num_users)
+        if not recs_ptr:
             return []
-        
-        results = []
-        for i in range(k):
-            if c_array[i] == -1:  # Sentinel
+
+        results: List[int] = []
+        for i in range(actual_k):
+            rec = recs_ptr[i]
+            if rec.user_id < 0:
                 break
-            results.append(c_array[i])
-        
-        self.lib.rec_engine_free_array(c_array)
+            results.append(int(rec.user_id))
+
+        self._libc.free(ctypes.cast(recs_ptr, ctypes.c_void_p))
         return results
-    
-    def get_item_recommendations(self, user_id: int, k: int = 10,
-                                num_neighbors: int = 10) -> List[int]:
-        """
-        Get k item recommendations for a user
-        
-        Args:
-            user_id: Target user ID
-            k: Number of recommendations
-            num_neighbors: Number of similar users to use in prediction
-            
-        Returns:
-            List of item IDs sorted by predicted rating
-        """
+
+    def get_item_recommendations(
+        self, user_id: int, k: int = 10, num_neighbors: int = 10
+    ) -> List[int]:
         if not self._initialized:
             raise RuntimeError("Engine not initialized. Call init() first.")
-        
-        c_array = self.lib.rec_engine_get_item_recommendations(
-            user_id, k, num_neighbors
+
+        actual_k = min(k, self._num_items)
+        actual_neighbors = min(num_neighbors, self._num_users - 1)
+        sim_ptr = self._sim_flat.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        rating_ptr = self._rating_flat.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+
+        recs_ptr = self._lib.get_item_recommendations(
+            sim_ptr, rating_ptr, user_id, actual_k,
+            self._num_users, self._num_items, actual_neighbors,
         )
-        if not c_array:
+        if not recs_ptr:
             return []
-        
-        results = []
-        for i in range(k):
-            if c_array[i] == -1:  # Sentinel
+
+        results: List[int] = []
+        for i in range(actual_k):
+            rec = recs_ptr[i]
+            if rec.item_id < 0:
                 break
-            results.append(c_array[i])
-        
-        self.lib.rec_engine_free_array(c_array)
+            results.append(int(rec.item_id))
+
+        self._libc.free(ctypes.cast(recs_ptr, ctypes.c_void_p))
         return results
-    
+
     def get_similarity(self, user_id_a: int, user_id_b: int) -> float:
-        """Get similarity score between two users"""
         if not self._initialized:
             raise RuntimeError("Engine not initialized. Call init() first.")
-        
-        return self.lib.rec_engine_get_similarity(user_id_a, user_id_b)
-    
+        return float(self._sim_matrix[user_id_a, user_id_b])
+
     def get_dimensions(self) -> Tuple[int, int]:
-        """Get (num_users, num_items)"""
         if not self._initialized:
             raise RuntimeError("Engine not initialized. Call init() first.")
-        
-        num_users = ctypes.c_int()
-        num_items = ctypes.c_int()
-        self.lib.rec_engine_get_dimensions(
-            ctypes.byref(num_users), ctypes.byref(num_items)
+        return (self._num_users, self._num_items)
+
+    def print_status(self) -> None:
+        print(
+            f"RecEngine: {self._num_users} users × {self._num_items} items, "
+            f"initialized={self._initialized}"
         )
-        return (num_users.value, num_items.value)
-    
-    def print_status(self):
-        """Print engine status"""
-        self.lib.rec_engine_print_status()
-    
-    def cleanup(self):
-        """Cleanup and free resources"""
-        self.lib.rec_engine_cleanup()
+
+    def cleanup(self) -> None:
+        self._sim_flat = None
+        self._rating_flat = None
+        self._sim_matrix = None
         self._initialized = False
-    
-    def __del__(self):
-        """Ensure cleanup on deletion"""
+
+    def __del__(self) -> None:
         if self._initialized:
             self.cleanup()
 
 
-# Singleton instance
+# ── Singleton ──────────────────────────────────────────────────────────────────
+
 _engine_instance: Optional[RecEngineWrapper] = None
 
 
 def get_engine(library_path: Optional[str] = None) -> RecEngineWrapper:
-    """Get or create singleton engine instance"""
+    """Return the process-wide singleton engine instance."""
     global _engine_instance
     if _engine_instance is None:
         _engine_instance = RecEngineWrapper(library_path)
