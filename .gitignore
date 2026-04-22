@@ -1,17 +1,27 @@
 # Python
 __pycache__/
 *.py[cod]
+*.egg-info/
 venv/
 .env
 
-# C/C++
+# C/C++ build artifacts
 *.o
 *.so
 *.out
 *.exe
+*.a
+
+# Compiled binaries in bin/ directories (no extension)
+src/host-cuda/*/src/bin/
+
+# Lambda deployment packages
+*.zip
 
 # Docker
 *.log
+
+# Data directories (generated at runtime)
 data/
 
 # Vagrant
