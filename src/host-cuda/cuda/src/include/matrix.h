@@ -14,4 +14,6 @@ void free_matrix(Matrix *matrix);
 void print_matrix(const Matrix *matrix);
 float *compute_norms(const Matrix *matrix);
 
+float *compute_similarity_cuda(const Matrix *matrix, const float *norms);
+
 #endif

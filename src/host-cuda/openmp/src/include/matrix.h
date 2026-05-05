@@ -21,4 +21,6 @@ float *compute_norms(const Matrix *matrix);
 
 float *compute_similarity(const Matrix *matrix, const float *norms);
 
+float *compute_similarity_omp(const Matrix *matrix, const float *norms);
+
 #endif

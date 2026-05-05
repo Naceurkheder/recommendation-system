@@ -2,36 +2,45 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
-    g++ \
+    libgomp1 \
     libomp-dev \
-    libpq-dev \
     uuid-dev \
+    libuuid1 \
+    libpq-dev \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
+COPY src/host-cuda/openmp/src/ /build/openmp/
+COPY src/host-cuda/cuda/src/   /build/cuda/
+
+RUN gcc -shared -fPIC -O3 -std=c11 -fopenmp \
+    -I/build/openmp/include \
+    /build/openmp/src/data.c \
+    /build/openmp/src/file_reader.c \
+    /build/openmp/src/parser.c \
+    /build/openmp/src/matrix.c \
+    /build/openmp/src/recommendations.c \
+    -luuid -lm \
+    -o /usr/local/lib/librec_engine_openmp.so \
+ && gcc -shared -fPIC -O3 -std=c11 -fopenmp \
+    -I/build/cuda/include \
+    /build/cuda/src/data.c \
+    /build/cuda/src/file_reader.c \
+    /build/cuda/src/parser.c \
+    /build/cuda/src/matrix.c \
+    /build/cuda/src/cuda_compat.c \
+    /build/cuda/src/recommendations.c \
+    -luuid -lm \
+    -o /usr/local/lib/librec_engine_cuda.so \
+ && cp /usr/local/lib/librec_engine_openmp.so /usr/local/lib/librec_engine.so \
+ && ldconfig \
+ && rm -rf /build
+
 COPY src/vm-services/api/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Compile shared C library from MPI sources (matrix.c present there; OpenMP parallel)
-# Excludes main.c and mpi_similarity.c — only sequential/OpenMP functions needed
-COPY src/host-cuda/mpi/src/src/ /tmp/c_src/
-COPY src/host-cuda/mpi/src/include/ /tmp/c_include/
-RUN gcc -shared -fPIC -fopenmp -O3 -std=c11 \
-        -I/tmp/c_include \
-        /tmp/c_src/data.c \
-        /tmp/c_src/file_reader.c \
-        /tmp/c_src/parser.c \
-        /tmp/c_src/matrix.c \
-        /tmp/c_src/recommendations.c \
-        -o /usr/local/lib/librec_engine.so \
-        -luuid -lm -fopenmp && \
-    ldconfig && \
-    rm -rf /tmp/c_src /tmp/c_include
-
-# Copy application code (volume-mounted in dev; this is for prod image)
 COPY src/vm-services/api/ .
 
 EXPOSE 8000
