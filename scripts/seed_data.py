@@ -1,11 +1,3 @@
-"""
-Seed PostgreSQL with sample users, products, and interactions.
-Run after docker compose up + setup_localstack.sh, only when tables are empty.
-
-Usage:
-    python scripts/seed_data.py
-    DATABASE_URL=postgresql://... python scripts/seed_data.py
-"""
 
 import os
 import sys
@@ -22,7 +14,7 @@ DATABASE_URL = os.getenv(
 )
 
 INTERACTION_TYPES = ["view", "like", "purchase"]
-WEIGHTS = [0.5, 0.3, 0.2]  # view is most common
+WEIGHTS = [0.5, 0.3, 0.2]
 
 NUM_USERS        = 100
 NUM_PRODUCTS     = 500
@@ -35,11 +27,9 @@ SEED_USERS: List[Tuple[str, str]] = [
 CATEGORIES = ["electronics", "books", "clothing", "food", "sports",
                "home", "toys", "beauty", "automotive", "garden"]
 
-
 def tables_empty(cur) -> bool:
     cur.execute("SELECT COUNT(*) FROM users")
     return cur.fetchone()[0] == 0
-
 
 def seed(conn) -> None:
     with conn.cursor() as cur:
@@ -47,7 +37,6 @@ def seed(conn) -> None:
             print("Tables already have data — skipping seed")
             return
 
-        # Users
         user_ids = []
         for name, email in SEED_USERS:
             cur.execute(
@@ -57,7 +46,6 @@ def seed(conn) -> None:
             user_ids.append(cur.fetchone()[0])
         print(f"Inserted {len(user_ids)} users")
 
-        # Products
         product_ids = []
         for i in range(NUM_PRODUCTS):
             cat = CATEGORIES[i % len(CATEGORIES)]
@@ -68,7 +56,6 @@ def seed(conn) -> None:
             product_ids.append(str(cur.fetchone()[0]))
         print(f"Inserted {len(product_ids)} products")
 
-        # Interactions
         rng = random.Random(42)
         interaction_data = []
         for _ in range(NUM_INTERACTIONS):
@@ -86,7 +73,6 @@ def seed(conn) -> None:
 
     conn.commit()
     print("Seed complete")
-
 
 if __name__ == "__main__":
     try:

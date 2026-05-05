@@ -1,67 +1,63 @@
 #!/usr/bin/env bash
-# One-command stack bring-up:
-#   1. docker compose up (all services)
-#   2. Wait for all healthchecks
-#   3. Provision LocalStack (12 AWS services)
-#   4. Seed PostgreSQL if empty
-#   5. Run integration tests
 set -euo pipefail
+
+export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 COMPOSE_FILE="$PROJECT_ROOT/infra/docker/docker-compose.yml"
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-info()  { echo "[$(date +%H:%M:%S)] $*"; }
-error() { echo "[$(date +%H:%M:%S)] ERROR: $*" >&2; }
+log()   { echo "[$(date +%H:%M:%S)] $*"; }
+fail()  { echo "[$(date +%H:%M:%S)] ERROR: $*" >&2; exit 1; }
+
+if [ ! -f "$PROJECT_ROOT/dist/librec_engine.so" ]; then
+    fail "dist/librec_engine.so not found. Run 'bash launch.sh' from the host first."
+fi
 
 wait_healthy() {
-    local service="$1"
-    local max_wait="${2:-120}"
-    info "Waiting for $service to be healthy..."
+    local service="$1" max_wait="${2:-120}"
+    log "Waiting for $service"
     local deadline=$((SECONDS + max_wait))
     while [ $SECONDS -lt $deadline ]; do
-        STATUS=$(docker compose -f "$COMPOSE_FILE" ps --format json "$service" 2>/dev/null \
-            | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('Health',''))" 2>/dev/null \
-            || docker compose -f "$COMPOSE_FILE" ps "$service" 2>/dev/null | grep -o 'healthy' || echo "")
-        if echo "$STATUS" | grep -qi "healthy"; then
-            info "$service is healthy"
+        STATUS=$(docker compose -f "$COMPOSE_FILE" ps "$service" 2>/dev/null \
+            | grep -oE 'healthy|unhealthy' | head -1 || echo "")
+        if [ "$STATUS" = "healthy" ]; then
             return 0
         fi
         sleep 3
     done
-    error "$service did not become healthy within ${max_wait}s"
     docker compose -f "$COMPOSE_FILE" logs --tail=30 "$service" >&2
-    return 1
+    fail "$service did not become healthy within ${max_wait}s"
 }
 
-# ── Step 1: Docker Compose up ─────────────────────────────────────────────────
-info "Starting all services..."
-docker compose -f "$COMPOSE_FILE" up -d --build
-info "Containers started"
+mkdir -p "$PROJECT_ROOT/data"
 
-# ── Step 2: Wait for healthchecks ─────────────────────────────────────────────
+log "Starting services"
+docker compose -f "$COMPOSE_FILE" up -d --build
+
 wait_healthy localstack 120
 wait_healthy db 60
 wait_healthy redis 30
 
-# Give the API and worker a moment to initialize
-info "Waiting for API to start..."
+log "Waiting for API"
 for i in $(seq 1 40); do
     if curl -sf http://localhost:8000/health >/dev/null 2>&1; then
-        info "API is up"
         break
     fi
-    [ "$i" -eq 40 ] && { error "API did not start in time"; exit 1; }
+    [ "$i" -eq 40 ] && fail "API did not start"
     sleep 3
 done
 
-# ── Step 3: Provision LocalStack ──────────────────────────────────────────────
-info "Provisioning LocalStack AWS services..."
+log "Provisioning LocalStack"
 bash "$SCRIPT_DIR/setup_localstack.sh"
 
-# ── Step 4: Seed PostgreSQL (if empty) ────────────────────────────────────────
-info "Seeding PostgreSQL..."
+log "Validating LocalStack"
+bash "$SCRIPT_DIR/validate_localstack.sh" "http://localhost:4566" || {
+    docker compose -f "$COMPOSE_FILE" logs --tail=50 localstack >&2
+    fail "LocalStack validation failed"
+}
+
+log "Seeding PostgreSQL"
 if python3 - <<'PYEOF' 2>/dev/null; then
 import psycopg2
 conn = psycopg2.connect("host=localhost port=5432 dbname=recsys_db user=recsys_admin password=secure_password")
@@ -71,27 +67,57 @@ count = cur.fetchone()[0]
 conn.close()
 exit(0 if count > 0 else 1)
 PYEOF
-    info "Database already has data — skipping seed"
+    log "Database already seeded"
 else
     python3 "$SCRIPT_DIR/seed_data.py"
 fi
 
-# ── Step 5: Run integration tests ─────────────────────────────────────────────
-info "Running integration tests..."
-cd "$PROJECT_ROOT"
+log "Exporting matrix.csv"
+export MATRIX_CSV="$PROJECT_ROOT/data/matrix.csv"
+python3 <<'PYEOF'
+import psycopg2, os, sys
+conn = psycopg2.connect("host=localhost port=5432 dbname=recsys_db user=recsys_admin password=secure_password")
+cur = conn.cursor()
+cur.execute("""
+    SELECT user_id, product_id::text,
+        CASE interaction_type
+            WHEN 'purchase' THEN 1.0
+            WHEN 'like'     THEN 0.7
+            WHEN 'view'     THEN 0.3
+            ELSE 0.1
+        END
+    FROM interactions ORDER BY user_id
+""")
+rows = cur.fetchall()
+conn.close()
+if not rows:
+    sys.exit(0)
+with open(os.environ["MATRIX_CSV"], "w") as f:
+    for uid, pid, rating in rows:
+        f.write(f"{uid},{pid},{float(rating):.4f}\n")
+PYEOF
 
-# Install test dependencies if not present
+log "Restarting API to load matrix"
+docker compose -f "$COMPOSE_FILE" restart api
+for i in $(seq 1 40); do
+    if curl -sf http://localhost:8000/health >/dev/null 2>&1; then
+        break
+    fi
+    [ "$i" -eq 40 ] && fail "API did not restart"
+    sleep 3
+done
+
+log "Running integration tests"
+cd "$PROJECT_ROOT"
 python3 -c "import pytest, requests" 2>/dev/null || \
     pip install pytest requests boto3 psycopg2-binary --quiet
-
-pytest tests/test_integration.py -v --tb=short 2>&1
+pytest tests/test_integration.py -v --tb=short
 EXIT_CODE=$?
 
-echo ""
-if [ $EXIT_CODE -eq 0 ]; then
-    info "All tests passed ✓"
-else
-    error "Some tests failed — check output above"
-fi
+VM_IP="192.168.56.10"
+log "Stack live"
+echo "  Platform    http://$VM_IP:3000"
+echo "  API         http://$VM_IP:8000"
+echo "  LocalStack  http://$VM_IP:4566/_localstack/health"
 
 exit $EXIT_CODE
