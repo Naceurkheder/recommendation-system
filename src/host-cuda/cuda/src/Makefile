@@ -19,9 +19,14 @@ OBJS_CUDA_CU = $(SRCS_CUDA_CU:.cu=.o)
 OBJS_CUDA = $(OBJS_CUDA_C) $(OBJS_CUDA_CU)
 TARGET_CUDA = $(BIN_DIR)/similarity_cuda
 
-.PHONY: all cuda clean run
+LIB_CPU_SRCS = $(SRC_DIR)/data.c $(SRC_DIR)/file_reader.c $(SRC_DIR)/parser.c \
+               $(SRC_DIR)/matrix.c $(SRC_DIR)/recommendations.c \
+               $(SRC_DIR)/cuda_compat.c
+LIB_CPU_TARGET = librec_engine_cuda.so
 
-all: cuda
+.PHONY: all cuda librec_engine_cuda.so clean run
+
+all: cuda librec_engine_cuda.so
 
 cuda: $(if $(filter 1,$(HAVE_NVCC)),$(TARGET_CUDA),)
 	$(if $(filter 0,$(HAVE_NVCC)),@echo "nvcc not found - skipping CUDA build",)
@@ -29,7 +34,6 @@ cuda: $(if $(filter 1,$(HAVE_NVCC)),$(TARGET_CUDA),)
 $(TARGET_CUDA): $(OBJS_CUDA)
 	@mkdir -p $(BIN_DIR)
 	$(NVCC) $(OBJS_CUDA) -o $(TARGET_CUDA) $(CUDA_LDFLAGS)
-	@echo "✓ Built CUDA version: $(TARGET_CUDA)"
 
 $(SRC_DIR)/%.o: $(SRC_DIR)/%.c
 	$(CC) $(CC_CFLAGS) -c $< -o $@
@@ -37,10 +41,15 @@ $(SRC_DIR)/%.o: $(SRC_DIR)/%.c
 $(SRC_DIR)/%.o: $(SRC_DIR)/%.cu
 	$(NVCC) $(CUDA_CFLAGS) -c $< -o $@
 
+librec_engine_cuda.so: $(LIB_CPU_SRCS)
+	gcc -shared -fPIC -fopenmp -O3 -std=c11 \
+	    -Iinclude \
+	    $(LIB_CPU_SRCS) \
+	    -o $(LIB_CPU_TARGET) \
+	    -luuid -lm -fopenmp
+
 clean:
-	@rm -f $(SRC_DIR)/*.o $(TARGET_CUDA)
-	@echo "✓ Cleaned CUDA build"
+	@rm -f $(SRC_DIR)/*.o $(TARGET_CUDA) $(LIB_CPU_TARGET)
 
 run: cuda
-	@echo "\n=== Running CUDA Version ==="
 	./$(TARGET_CUDA)
