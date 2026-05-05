@@ -1,8 +1,3 @@
-"""
-Compute worker: polls SQS FIFO, exports PostgreSQL interactions, runs the C
-similarity engine via ctypes, writes results to Redis + S3, updates DynamoDB,
-publishes to SNS.
-"""
 
 import json
 import logging
@@ -19,16 +14,14 @@ import psycopg2.extras
 import redis as redis_module
 import numpy as np
 
-from ctypes_bridge import RecEngineBridge
+from ctypes_bridge import create_bridge, EngineType
 
-# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("worker")
 
-# ── Config ────────────────────────────────────────────────────────────────────
 AWS_ENDPOINT  = os.getenv("AWS_ENDPOINT_URL",     "http://localstack:4566")
 AWS_REGION    = os.getenv("AWS_DEFAULT_REGION",    "us-east-1")
 QUEUE_NAME    = "compute-jobs.fifo"
@@ -37,20 +30,16 @@ S3_BUCKET     = "similarity-matrices"
 SNS_TOPIC_ARN = f"arn:aws:sns:{AWS_REGION}:000000000000:compute-complete"
 LOG_GROUP     = "/app/worker"
 CACHE_KEY_FMT = "recs:{user_id}:latest"
-CACHE_TTL     = 86400        # 24 h
+CACHE_TTL     = 86400
 TOP_K         = 50
 LONG_POLL_S   = 20
 
-# Rating weights for implicit feedback
 RATING_MAP: Dict[str, float] = {
     "purchase": 1.0,
     "like":     0.7,
     "view":     0.3,
 }
 DEFAULT_RATING = 0.1
-
-
-# ── AWS / DB helpers ──────────────────────────────────────────────────────────
 
 def _boto(service: str) -> Any:
     return boto3.client(
@@ -61,26 +50,23 @@ def _boto(service: str) -> Any:
         aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY", "test"),
     )
 
+def _fetch_secret(secrets_client: Any, secret_id: str, default: Optional[Dict] = None) -> Dict:
 
-def _fetch_secret(secrets_client: Any, secret_id: str) -> Dict:
-    """Retry-loop for Secrets Manager (not provisioned until setup script runs)."""
-    for attempt in range(20):
-        try:
-            raw = secrets_client.get_secret_value(SecretId=secret_id)
-            return json.loads(raw["SecretString"])
-        except ClientError as exc:
-            code = exc.response["Error"]["Code"]
-            if code in ("ResourceNotFoundException", "InvalidRequestException"):
-                if attempt < 19:
-                    logger.info("Secret %s not ready, retry %d/20", secret_id, attempt + 1)
-                    time.sleep(3)
-                    continue
-            raise
-    raise RuntimeError(f"Secret {secret_id} unavailable")
-
+    try:
+        raw = secrets_client.get_secret_value(SecretId=secret_id)
+        return json.loads(raw["SecretString"])
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] == "ResourceNotFoundException" and default is not None:
+            try:
+                secrets_client.create_secret(Name=secret_id, SecretString=json.dumps(default))
+                logger.info("Auto-provisioned Secrets Manager secret: %s", secret_id)
+            except Exception:
+                pass
+            return default
+        raise
 
 def _log_cw(logs_client: Any, message: str) -> None:
-    """Best-effort CloudWatch emit."""
+
     try:
         logs_client.put_log_events(
             logGroupName=LOG_GROUP,
@@ -90,14 +76,26 @@ def _log_cw(logs_client: Any, message: str) -> None:
     except Exception:
         pass
 
+def _connect_db_with_retry(dsn: str, max_attempts: int = 8, interval: float = 3.0) -> Any:
 
-# ── Startup: credentials + clients ───────────────────────────────────────────
+    last_exc: Exception = RuntimeError("unreachable")
+    for attempt in range(1, max_attempts + 1):
+        try:
+            conn = psycopg2.connect(dsn)
+            conn.autocommit = True
+            return conn
+        except Exception as exc:
+            last_exc = exc
+            if attempt < max_attempts:
+                logger.warning(
+                    "DB connect attempt %d/%d failed (%s) — retrying in %.0fs",
+                    attempt, max_attempts, exc, interval,
+                )
+                time.sleep(interval)
+    raise last_exc
 
 def init_clients() -> Tuple[Any, Any, Any, Any, Any, Any, Any]:
-    """
-    Fetch credentials from Secrets Manager, open DB + Redis connections,
-    return (sqs, dynamodb, s3, sns, logs, db_conn, redis_conn).
-    """
+
     secrets = _boto("secretsmanager")
     sqs      = _boto("sqs")
     dynamodb = _boto("dynamodb")
@@ -105,53 +103,54 @@ def init_clients() -> Tuple[Any, Any, Any, Any, Any, Any, Any]:
     sns      = _boto("sns")
     logs     = _boto("logs")
 
-    # Ensure CloudWatch log stream exists
+    try:
+        logs.create_log_group(logGroupName=LOG_GROUP)
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "ResourceAlreadyExistsException":
+            pass
+    except Exception:
+        pass
     try:
         logs.create_log_stream(logGroupName=LOG_GROUP, logStreamName="worker")
-    except ClientError:
+    except Exception:
         pass
 
-    # PostgreSQL
+    _pg_default = {
+        "host": "db", "port": 5432, "database": "recsys_db",
+        "username": "recsys_admin", "password": "secure_password",
+    }
+    _rd_default = {"host": "redis", "port": 6379, "password": ""}
+
     try:
-        pg = _fetch_secret(secrets, "db/postgres")
+        pg = _fetch_secret(secrets, "db/postgres", _pg_default)
         dsn = (
             f"host={pg['host']} port={pg['port']} dbname={pg['database']} "
             f"user={pg['username']} password={pg['password']}"
         )
     except Exception as exc:
-        fallback = os.getenv("DATABASE_URL", "postgresql://recsys_admin:secure_password@db:5432/recsys_db")
-        dsn = fallback
-        logger.warning("Secrets Manager unavailable (%s), using DATABASE_URL fallback", exc)
+        dsn = os.getenv("DATABASE_URL", "postgresql://recsys_admin:secure_password@db:5432/recsys_db")
+        logger.warning("Secrets Manager unreachable (%s) — using DATABASE_URL env var", exc)
 
-    db_conn = psycopg2.connect(dsn)
-    db_conn.autocommit = True
+    db_conn = _connect_db_with_retry(dsn)
     logger.info("PostgreSQL connected")
 
-    # Redis
     try:
-        rd = _fetch_secret(secrets, "redis/config")
+        rd = _fetch_secret(secrets, "redis/config", _rd_default)
         redis_host, redis_port = rd["host"], int(rd["port"])
     except Exception as exc:
         redis_url = os.getenv("REDIS_URL", "redis://redis:6379")
         parts = redis_url.replace("redis://", "").split(":")
         redis_host = parts[0]
         redis_port = int(parts[1]) if len(parts) > 1 else 6379
-        logger.warning("Redis secret unavailable (%s), using REDIS_URL fallback", exc)
+        logger.warning("Redis secret unreachable (%s) — using REDIS_URL env var", exc)
 
     redis_conn = redis_module.Redis(host=redis_host, port=redis_port, decode_responses=True)
     logger.info("Redis connected at %s:%d", redis_host, redis_port)
 
     return sqs, dynamodb, s3, sns, logs, db_conn, redis_conn
 
-
-# ── Core pipeline ─────────────────────────────────────────────────────────────
-
 def export_interactions_to_csv(db_conn: Any, csv_path: str) -> int:
-    """
-    Query PostgreSQL interactions table, write CSV for the C engine.
-    Format: user_id,product_id,rating (no header)
-    Returns number of rows written.
-    """
+
     with db_conn.cursor() as cur:
         cur.execute(
             """
@@ -181,14 +180,13 @@ def export_interactions_to_csv(db_conn: Any, csv_path: str) -> int:
     logger.info("Exported %d interactions to %s", len(rows), csv_path)
     return len(rows)
 
-
 def _update_dynamo_status(
     dynamodb: Any,
     job_id: str,
     status: str,
     extra: Optional[Dict] = None,
 ) -> None:
-    """Update DynamoDB job record status."""
+
     now = datetime.now(timezone.utc).isoformat()
     update_expr = "SET #s = :s, updated_at = :u"
     expr_names  = {"#s": "status"}
@@ -207,9 +205,9 @@ def _update_dynamo_status(
             ExpressionAttributeNames=expr_names,
             ExpressionAttributeValues=expr_values,
         )
+        logger.info("DynamoDB job_id=%s status → %s", job_id, status)
     except Exception as exc:
-        logger.warning("DynamoDB status update failed: %s", exc)
-
+        logger.error("DynamoDB update FAILED job_id=%s status=%s: %s", job_id, status, exc)
 
 def process_message(
     body: Dict,
@@ -222,20 +220,16 @@ def process_message(
     redis_conn: Any,
     receipt_handle: str,
 ) -> bool:
-    """
-    Full compute pipeline for one SQS message.
-    Returns True on success (message deleted); False on failure (message left for retry).
-    """
+
     job_id  = body.get("job_id",  "unknown")
     user_id = body.get("user_id", "all")
     logger.info("Processing job_id=%s user_id=%s", job_id, user_id)
     _log_cw(logs, f"job_start job_id={job_id} user_id={user_id}")
 
-    # 1. Mark running
     _update_dynamo_status(dynamodb, job_id, "running")
 
     try:
-        # 2. Export interactions to temp CSV
+
         with tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w") as tmp:
             csv_path = tmp.name
 
@@ -249,18 +243,33 @@ def process_message(
             )
             return True
 
-        # 3. C ctypes bridge: load matrix, compute similarity, extract top-K
-        bridge = RecEngineBridge()
-        recommendations, similarity_matrix = bridge.compute_from_csv(csv_path, top_k=TOP_K)
+        engine_name = "openmp"
+        try:
+            val = redis_conn.get("active_engine")
+            if val and val in {"openmp", "mpi", "cuda"}:
+                engine_name = val
+        except Exception:
+            pass
 
-        # 4. Upload full similarity matrix to S3
+        logger.info("Initialising bridge for engine: %s", engine_name)
+        bridge = create_bridge(engine_name)
+        bridge_type = type(bridge).__name__
+        logger.info("Bridge ready: %s (requested: %s)", bridge_type, engine_name)
+
+        recommendations, similarity_matrix, engine_timing = bridge.compute_from_csv(
+            csv_path, top_k=TOP_K
+        )
+        logger.info("Engine timing: %s", engine_timing)
+
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         s3_key = f"matrices/{timestamp}.json"
         matrix_payload = {
-            "timestamp": timestamp,
-            "job_id":    job_id,
-            "shape":     list(similarity_matrix.shape),
-            "data":      similarity_matrix.tolist(),
+            "timestamp":     timestamp,
+            "job_id":        job_id,
+            "engine":        engine_name,
+            "engine_timing": engine_timing,
+            "shape":         list(similarity_matrix.shape),
+            "data":          similarity_matrix.tolist(),
         }
         s3.put_object(
             Bucket=S3_BUCKET,
@@ -270,7 +279,6 @@ def process_message(
         )
         logger.info("Uploaded similarity matrix to s3://%s/%s", S3_BUCKET, s3_key)
 
-        # 5. Write per-user top-K to Redis with 24 h TTL
         pipe = redis_conn.pipeline()
         now_iso = datetime.now(timezone.utc).isoformat()
         for uid, recs in recommendations.items():
@@ -280,13 +288,11 @@ def process_message(
         pipe.execute()
         logger.info("Wrote Redis cache for %d users", len(recommendations))
 
-        # 6. Update DynamoDB to complete
         _update_dynamo_status(dynamodb, job_id, "complete", {
             "s3_key":    s3_key,
             "row_count": str(row_count),
         })
 
-        # 7. Publish to SNS
         try:
             sns.publish(
                 TopicArn=SNS_TOPIC_ARN,
@@ -302,7 +308,6 @@ def process_message(
         except Exception as exc:
             logger.warning("SNS publish failed (non-fatal): %s", exc)
 
-        # 8. Delete SQS message on success
         queue_url = sqs.get_queue_url(QueueName=QUEUE_NAME)["QueueUrl"]
         sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
 
@@ -314,7 +319,7 @@ def process_message(
         logger.error("Job %s failed: %s", job_id, exc, exc_info=True)
         _update_dynamo_status(dynamodb, job_id, "failed")
         _log_cw(logs, f"job_failed job_id={job_id} error={exc}")
-        # Do NOT delete message — let SQS retry → DLQ after maxReceiveCount=3
+
         return False
 
     finally:
@@ -323,15 +328,33 @@ def process_message(
         except Exception:
             pass
 
+def _ensure_queue_url(sqs_client: Any, queue_name: str) -> str:
 
-# ── Main polling loop ─────────────────────────────────────────────────────────
+    try:
+        return sqs_client.get_queue_url(QueueName=queue_name)["QueueUrl"]
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "AWS.SimpleQueueService.NonExistentQueue":
+            raise
+        logger.info("SQS queue %s missing — creating now", queue_name)
+        try:
+            sqs_client.create_queue(
+                QueueName="compute-jobs-dlq.fifo",
+                Attributes={"FifoQueue": "true", "ContentBasedDeduplication": "true"},
+            )
+        except Exception:
+            pass
+        sqs_client.create_queue(
+            QueueName=queue_name,
+            Attributes={"FifoQueue": "true", "ContentBasedDeduplication": "true"},
+        )
+        return sqs_client.get_queue_url(QueueName=queue_name)["QueueUrl"]
 
 def main() -> None:
     logger.info("Worker starting up...")
 
     sqs, dynamodb, s3, sns, logs, db_conn, redis_conn = init_clients()
 
-    queue_url = sqs.get_queue_url(QueueName=QUEUE_NAME)["QueueUrl"]
+    queue_url = _ensure_queue_url(sqs, QUEUE_NAME)
     logger.info("Polling SQS queue: %s", queue_url)
 
     while True:
@@ -364,7 +387,6 @@ def main() -> None:
         except Exception as exc:
             logger.error("Poll loop error: %s", exc, exc_info=True)
             time.sleep(5)
-
 
 if __name__ == "__main__":
     main()
