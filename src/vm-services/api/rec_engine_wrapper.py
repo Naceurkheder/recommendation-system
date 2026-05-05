@@ -1,24 +1,9 @@
-"""
-Python wrapper for librec_engine.so (compiled from MPI C sources).
-
-Actual exported symbols used:
-  Matrix  *load_matrix(const char *filename)
-  void     free_matrix(Matrix *matrix)
-  UserRec *get_similar_users(float *sim_matrix, int user_id, int k, int num_users)
-  ItemRec *get_item_recommendations(float *sim, float *ratings, int user_id,
-                                     int k, int num_users, int num_items, int num_neighbors)
-
-Cosine similarity is computed in numpy from the loaded rating matrix.
-"""
 
 import ctypes
 import os
 from typing import List, Optional, Tuple
 
 import numpy as np
-
-
-# ── ctypes struct mirrors ──────────────────────────────────────────────────────
 
 class _Matrix(ctypes.Structure):
     _fields_ = [
@@ -27,13 +12,11 @@ class _Matrix(ctypes.Structure):
         ("cols", ctypes.c_int),
     ]
 
-
 class _UserRec(ctypes.Structure):
     _fields_ = [
         ("user_id",          ctypes.c_int),
         ("similarity_score", ctypes.c_float),
     ]
-
 
 class _ItemRec(ctypes.Structure):
     _fields_ = [
@@ -41,11 +24,7 @@ class _ItemRec(ctypes.Structure):
         ("predicted_rating", ctypes.c_float),
     ]
 
-
-# ── Wrapper ───────────────────────────────────────────────────────────────────
-
 class RecEngineWrapper:
-    """High-level Python interface to the C recommendation engine."""
 
     def __init__(self, library_path: Optional[str] = None) -> None:
         if library_path is None:
@@ -64,10 +43,10 @@ class RecEngineWrapper:
         self._initialized: bool = False
         self._num_users: int = 0
         self._num_items: int = 0
-        # Stored as contiguous float32 numpy arrays to avoid repeated copies
-        self._sim_flat: Optional[np.ndarray] = None     # (num_users * num_users,)
-        self._rating_flat: Optional[np.ndarray] = None  # (num_users * num_items,)
-        self._sim_matrix: Optional[np.ndarray] = None   # (num_users, num_users) view
+
+        self._sim_flat: Optional[np.ndarray] = None
+        self._rating_flat: Optional[np.ndarray] = None
+        self._sim_matrix: Optional[np.ndarray] = None
 
     def _setup_functions(self) -> None:
         lib = self._lib
@@ -113,11 +92,9 @@ class RecEngineWrapper:
         num_items: int = matrix.cols
         n_elems = num_users * num_items
 
-        # Copy rating data out of C-owned memory before freeing
         rating_np = np.ctypeslib.as_array(matrix.data, shape=(n_elems,)).copy().astype(np.float32)
         rating_matrix = rating_np.reshape(num_users, num_items)
 
-        # Cosine similarity in numpy
         norms = np.linalg.norm(rating_matrix, axis=1, keepdims=True)
         norms[norms == 0.0] = 1.0
         normalized = rating_matrix / norms
@@ -125,7 +102,6 @@ class RecEngineWrapper:
 
         self._lib.free_matrix(matrix_ptr)
 
-        # Keep contiguous flat copies so C pointers stay valid during calls
         self._sim_flat = np.ascontiguousarray(sim_matrix.flatten(), dtype=np.float32)
         self._rating_flat = np.ascontiguousarray(rating_np, dtype=np.float32)
         self._sim_matrix = sim_matrix
@@ -209,14 +185,10 @@ class RecEngineWrapper:
         if self._initialized:
             self.cleanup()
 
-
-# ── Singleton ──────────────────────────────────────────────────────────────────
-
 _engine_instance: Optional[RecEngineWrapper] = None
 
-
 def get_engine(library_path: Optional[str] = None) -> RecEngineWrapper:
-    """Return the process-wide singleton engine instance."""
+
     global _engine_instance
     if _engine_instance is None:
         _engine_instance = RecEngineWrapper(library_path)

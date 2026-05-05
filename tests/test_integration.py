@@ -1,10 +1,3 @@
-"""
-Integration tests for the distributed recommendation system.
-Run against a live stack: docker compose up → setup_localstack.sh → pytest tests/
-
-All AWS calls target LocalStack at http://localhost:4566.
-All HTTP calls target the FastAPI app at http://localhost:8000 (override via API_URL).
-"""
 
 import json
 import os
@@ -16,7 +9,6 @@ import boto3
 import pytest
 import requests
 
-# ── Config ────────────────────────────────────────────────────────────────────
 API_URL      = os.getenv("API_URL",          "http://localhost:8000")
 LS_URL       = os.getenv("LOCALSTACK_URL",   "http://localhost:4566")
 AWS_REGION   = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
@@ -26,8 +18,6 @@ LOG_GROUP    = "/app/fastapi"
 
 HEADERS = {"Content-Type": "application/json"}
 
-
-# ── AWS client factory ────────────────────────────────────────────────────────
 def _boto(service: str):
     return boto3.client(
         service,
@@ -37,10 +27,8 @@ def _boto(service: str):
         aws_secret_access_key="test",
     )
 
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
 def _wait_for_job(job_id: str, timeout: int = 90) -> Optional[str]:
-    """Poll DynamoDB until job reaches terminal status or timeout."""
+
     dynamodb = _boto("dynamodb")
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -58,11 +46,7 @@ def _wait_for_job(job_id: str, timeout: int = 90) -> Optional[str]:
         time.sleep(3)
     return None
 
-
-# ── Tests ─────────────────────────────────────────────────────────────────────
-
 class TestServiceHealth:
-    """All container healthchecks must pass."""
 
     def test_api_health(self):
         resp = requests.get(f"{API_URL}/health", timeout=10)
@@ -73,7 +57,7 @@ class TestServiceHealth:
         resp = requests.get(f"{LS_URL}/_localstack/health", timeout=10)
         assert resp.status_code == 200
         health = resp.json()
-        # Core services must be running
+
         services = health.get("services", health)
         for svc in ("s3", "sqs", "dynamodb", "secretsmanager"):
             assert svc in str(services), f"LocalStack service {svc!r} not found"
@@ -100,11 +84,8 @@ class TestServiceHealth:
             data = json.loads(resp["SecretString"])
             assert len(data) > 0, f"Secret {secret_id} is empty"
 
-
 class TestInteractions:
-    """POST /interactions must persist to PostgreSQL."""
 
-    # Stable UUIDs for repeatable test data
     PRODUCT_A = "550e8400-e29b-41d4-a716-446655440001"
     PRODUCT_B = "550e8400-e29b-41d4-a716-446655440002"
     PRODUCT_C = "550e8400-e29b-41d4-a716-446655440003"
@@ -125,7 +106,7 @@ class TestInteractions:
         assert body["status"] == "created"
 
     def test_multiple_interactions_for_pipeline(self):
-        """Seed enough data for the worker to build a meaningful matrix."""
+
         interactions = [
             (1, self.PRODUCT_A, "purchase"),
             (1, self.PRODUCT_B, "view"),
@@ -140,24 +121,18 @@ class TestInteractions:
             resp = self._post(user_id, product_id, itype)
             assert resp.status_code == 201, f"Failed for {user_id}/{product_id}: {resp.text}"
 
-
 class TestRecommendationPipeline:
-    """End-to-end: cache miss → SQS → worker → Redis cache → 200."""
 
     TARGET_USER = 1
 
     def test_cache_miss_returns_202(self):
-        """First request for a user with no cached recs must return 202."""
+
         resp = requests.get(f"{API_URL}/recommendations/{self.TARGET_USER}", timeout=10)
-        # Could be 200 (cached from a previous run) or 202 (just dispatched)
+
         assert resp.status_code in (200, 202), resp.text
 
     def test_dispatch_and_wait_for_completion(self):
-        """
-        Dispatch a compute job and wait for the worker to complete it.
-        This test seeds data, dispatches, and polls DynamoDB for completion.
-        """
-        # Seed data first
+
         product_ids = [
             "550e8400-e29b-41d4-a716-446655440011",
             "550e8400-e29b-41d4-a716-446655440012",
@@ -170,7 +145,6 @@ class TestRecommendationPipeline:
                 timeout=10,
             )
 
-        # Dispatch job
         resp = requests.get(f"{API_URL}/recommendations/{self.TARGET_USER}", timeout=10)
         assert resp.status_code in (200, 202)
 
@@ -178,13 +152,11 @@ class TestRecommendationPipeline:
             job_id = resp.json().get("job_id")
             assert job_id, "202 response must include job_id"
 
-            # Poll DynamoDB
             final_status = _wait_for_job(job_id, timeout=90)
             assert final_status == "complete", (
                 f"Job {job_id} did not complete within 90s (status={final_status})"
             )
 
-            # Now cache should be warm
             time.sleep(1)
             recs_resp = requests.get(f"{API_URL}/recommendations/{self.TARGET_USER}", timeout=10)
             assert recs_resp.status_code == 200, recs_resp.text
@@ -193,25 +165,22 @@ class TestRecommendationPipeline:
             assert body.get("cached") is True
 
     def test_job_status_endpoint(self):
-        """GET /recommendations/{user_id}/status should return a valid job record."""
-        # Dispatch a job first so there's something in DynamoDB
+
         requests.get(f"{API_URL}/recommendations/{self.TARGET_USER}", timeout=10)
         time.sleep(1)
 
         resp = requests.get(f"{API_URL}/recommendations/{self.TARGET_USER}/status", timeout=10)
-        assert resp.status_code in (200, 404)  # 404 is valid if no jobs exist yet
+        assert resp.status_code in (200, 404)
         if resp.status_code == 200:
             body = resp.json()
             assert "job_id" in body
             assert "status" in body
             assert body["status"] in ("pending", "running", "complete", "failed")
 
-
 class TestS3Matrix:
-    """Worker must upload a similarity matrix to S3 after processing."""
 
     def test_matrix_file_exists_in_s3(self):
-        """After at least one successful compute job, matrices/ prefix must have files."""
+
         s3 = _boto("s3")
         resp = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix="matrices/")
         objects = resp.get("Contents", [])
@@ -219,7 +188,7 @@ class TestS3Matrix:
             "No matrix files in s3://similarity-matrices/matrices/ — "
             "ensure the worker has processed at least one job"
         )
-        # Latest file must be valid JSON with shape info
+
         latest = max(objects, key=lambda o: o["LastModified"])
         raw = s3.get_object(Bucket=S3_BUCKET, Key=latest["Key"])["Body"].read()
         data = json.loads(raw)
@@ -227,9 +196,7 @@ class TestS3Matrix:
         assert "data" in data
         assert len(data["data"]) > 0
 
-
 class TestCloudWatch:
-    """CloudWatch log groups must exist and be reachable."""
 
     def test_log_groups_exist(self):
         logs = _boto("logs")
