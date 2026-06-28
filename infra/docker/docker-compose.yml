@@ -1,37 +1,140 @@
 services:
+  localstack:
+    image: localstack/localstack-pro:4.4.0
+    ports:
+      - "4566:4566"
+    environment:
+      - LOCALSTACK_AUTH_TOKEN=ls-yOwe0145-Japo-yEno-wUsU-hesULUwAac46
+      - SERVICES=s3,sqs,sns,secretsmanager,events,logs,dynamodb
+      - DEBUG=1
+      - DEFAULT_REGION=us-east-1
+      - AWS_DEFAULT_REGION=us-east-1
+    volumes:
+      - localstack_data:/var/lib/localstack
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - recsys
+
   db:
     image: postgres:14-alpine
+    restart: always
     environment:
       POSTGRES_USER: recsys_admin
       POSTGRES_PASSWORD: secure_password
       POSTGRES_DB: recsys_db
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ../../src/vm-services/api/db/schema.sql:/docker-entrypoint-initdb.d/schema.sql
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U recsys_admin"]
+      test: ["CMD-SHELL", "pg_isready -U recsys_admin -d recsys_db"]
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - recsys
 
   redis:
     image: redis:7-alpine
+    restart: always
     ports:
       - "6379:6379"
     command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - recsys
 
   api:
     build:
-      context: ../../src/vm-services/api
-      dockerfile: ../../../infra/docker/api/Dockerfile
+      context: ../..
+      dockerfile: infra/docker/api/Dockerfile
+    restart: always
     ports:
       - "8000:8000"
-    depends_on:
-      - db
-      - redis
+    env_file:
+      - ../../.env
+    environment:
+      - AWS_DEFAULT_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_ENDPOINT_URL=http://localstack:4566
+      - REC_ENGINE_LIB=/usr/local/lib/librec_engine.so
+      - REC_ENGINE_DATA=/app/data/matrix.csv
     volumes:
-      - ../../src/vm-services/api:/app
+      - ../../data:/app/data
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    networks:
+      - recsys
+
+  worker:
+    build:
+      context: ../..
+      dockerfile: src/worker/Dockerfile
+    restart: always
+    env_file:
+      - ../../.env
+    environment:
+      - AWS_DEFAULT_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_ENDPOINT_URL=http://localstack:4566
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    networks:
+      - recsys
+
+  dashboard:
+    build:
+      context: ../..
+      dockerfile: src/dashboard/Dockerfile
+    restart: always
+    ports:
+      - "3000:3000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - AWS_DEFAULT_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_ENDPOINT_URL=http://localstack:4566
+      - DATABASE_URL=postgresql://recsys_admin:secure_password@db:5432/recsys_db
+      - REDIS_URL=redis://redis:6379
+      - API_URL=http://api:8000
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - recsys
+
+
+networks:
+  recsys:
+    driver: bridge
 
 volumes:
   pgdata:
+  localstack_data:

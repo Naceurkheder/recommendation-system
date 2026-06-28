@@ -10,6 +10,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libuuid1 \
     libpq-dev \
     curl \
+    openmpi-bin \
+    libopenmpi-dev \
     && rm -rf /var/lib/apt/lists/*
 
 COPY src/host-cuda/openmp/src/ /build/openmp/
@@ -38,14 +40,9 @@ RUN gcc -shared -fPIC -O3 -std=c11 -fopenmp \
  && ldconfig \
  && rm -rf /build
 
-COPY src/vm-services/api/requirements.txt .
+COPY src/worker/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY src/vm-services/api/ .
+COPY src/worker/ .
 
-EXPOSE 8000
-
-HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
-
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "worker.py"]
